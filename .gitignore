@@ -20,7 +20,7 @@ results
 disk-image/packer
 disk-image/packer_1.4.3_linux_amd64.zip
 disk-image/packer_cache
-disk-image/gpu-fs/gpu-fs-image/gpu-fs
+disk-image/gpu-fs
 
 # Linux kernel
 disk-image/vmlinux
