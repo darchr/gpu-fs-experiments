@@ -6,7 +6,7 @@ Cheetah==2.4.4
 configparser==4.0.2
 configshell-fb==1.1.24
 contextlib2==0.6.0.post1
-cryptography==2.1.4
+cryptography==2.3
 enum34==1.1.6
 idna==2.6
 importlib-metadata==0.23
@@ -25,7 +25,7 @@ pydot==1.2.3
 pygobject==3.26.1
 pyparsing==2.2.0
 pytz==2019.3
-pyxdg==0.25
+pyxdg==0.26
 scandir==1.10.0
 SecretStorage==2.3.1
 six==1.13.0
