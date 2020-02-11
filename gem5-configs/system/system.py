@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# Copyright (c) 2016 Jason Lowe-Power
-# All rights reserved.
+# Copyright (c) 2020 The Regents of the University of California
+# All Rights Reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are
@@ -26,213 +26,366 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 # Authors: Jason Lowe-Power
+#          Pouya Fotouhi
 
+import math
+
+import ConfigParser
 import m5
+
 from m5.objects import *
 from m5.util import convert
 from fs_tools import *
-from caches import *
+from common import SimpleOpts
+from ruby import Ruby
 
 class MySystem(LinuxX86System):
 
-    def __init__(self, kernel, disk, cpu_type, num_cpus, opts):
+    SimpleOpts.add_option("--no_host_parallel", default=False,
+        action="store_true",
+        help="Do NOT run gem5 on multiple host threads (kvm only)")
+
+    SimpleOpts.add_option("--disk-image",
+        default='/proj/radl_tools/fs/ubuntu-18.4.img',
+        help="The boot disk image to mount (/dev/hda)")
+
+   # SimpleOpts.add_option("--second-disk",
+   #     default='/proj/radl_tools/fs/linux-bigswap2.img',
+   #     help="The second disk image to mount (/dev/hdb)")
+
+    SimpleOpts.add_option("--kernel",
+        default='/proj/radl_tools/fs/vmlinux',
+        help="Linux kernel to boot")
+
+    def __init__(self, opts):
         super(MySystem, self).__init__()
         self._opts = opts
 
-        self._host_parallel = cpu_type == "kvm"
+        # Override defaults from common options / check for problems
+        self._opts.network = "garnet2.0"
+        self._opts.cpu_clock = '4GHz'
+        self._opts.ruby_clock = '2GHz'
+
 
         # Set up the clock domain and the voltage domain
         self.clk_domain = SrcClockDomain()
-        self.clk_domain.clock = '3GHz'
+        self.clk_domain.clock = self._opts.cpu_clock
         self.clk_domain.voltage_domain = VoltageDomain()
 
-        self.mem_ranges = [AddrRange(Addr('3GB')), # All data
-                           AddrRange(0xC0000000, size=0x100000), # For I/0
-                           ]
+        # Setup a single memory range for X86
+        self.setupMemoryRange()
 
-        # Create the main memory bus
-        # This connects to main memory
-        self.membus = SystemXBar(width = 64) # 64-byte width
-        self.membus.badaddr_responder = BadAddr()
-        self.membus.default = Self.badaddr_responder.pio
+        # Setup all the system devices
+        self.initFS()
 
-        # Set up the system port for functional access from the simulator
-        self.system_port = self.membus.slave
+        # Set the boot disk image and add a swap disk for large input size
+        # benchmarks.
+        #self.setDiskImages(opts.disk_image, opts.second_disk)
+        self.setDiskImage(opts.disk_image)
 
-        self.initFS(self.membus, num_cpus)
+        # Use our self built kernel with no ACPI and 9p support.
+        self.kernel = opts.kernel
 
-        # Replace these paths with the path to your disk images.
-        # The first disk is the root disk. The second could be used for swap
-        # or anything else.
-        self.setDiskImages(disk, disk)
-
-        # Change this path to point to the kernel you want to use
-        self.kernel = kernel
         # Options specified on the kernel command line
-        boot_options = ['earlyprintk=ttyS0', 'console=ttyS0', 'lpj=7999923',
-                         'root=/dev/hda1']
-
+        boot_options = ['earlyprintk=ttyS0', 'console=ttyS0,9600',
+                        'lpj=7999923', 'root=/dev/sda1',
+                        'drm_kms_helper.fbdev_emulation=0']
         self.boot_osflags = ' '.join(boot_options)
 
         # Create the CPUs for our system.
-        self.createCPU(cpu_type, num_cpus)
+        self.createCPU()
 
-        # Create the cache heirarchy for the system.
-        self.createCacheHierarchy()
+        # Create the GPU
+        if self._opts.dgpu or self._opts.apu:
+            self.createGPU()
+
+        # Create the memory heirarchy for the system.
+        self.createMemoryHierarchy()
 
         # Set up the interrupt controllers for the system (x86 specific)
         self.setupInterrupts()
 
-        self.createMemoryControllersDDR3()
-
-        if self._host_parallel:
-            # To get the KVM CPUs to run on different host CPUs
-            # Specify a different event queue for each CPU
-            for i,cpu in enumerate(self.cpu):
-                for obj in cpu.descendants():
-                    obj.eventq_index = 0
-                cpu.eventq_index = i + 1
-
-    def getHostParallel(self):
-        return self._host_parallel
-
-    def totalInsts(self):
-        return sum([cpu.totalInsts() for cpu in self.cpu])
-
-    def createCPU(self, cpu_type, num_cpus):
-        if cpu_type == "atomic":
-            self.cpu = [AtomicSimpleCPU(cpu_id = i)
-                              for i in range(num_cpus)]
-            self.mem_mode = 'atomic'
-        elif cpu_type == "kvm":
-            # Note KVM needs a VM and atomic_noncaching
-            self.cpu = [X86KvmCPU(cpu_id = i)
-                        for i in range(num_cpus)]
-            self.kvm_vm = KvmVM()
-            self.mem_mode = 'atomic_noncaching'
-        elif cpu_type == "o3":
-            self.cpu = [DerivO3CPU(cpu_id = i)
-                        for i in range(num_cpus)]
-            self.mem_mode = 'timing'
-        elif cpu_type == "simple":
-            self.cpu = [TimingSimpleCPU(cpu_id = i)
-                        for i in range(num_cpus)]
-            self.mem_mode = 'timing'
+    def setupMemoryRange(self):
+        mem_size = self._opts.mem_size
+        excess_mem_size = \
+                convert.toMemorySize(mem_size) - convert.toMemorySize('3GB')
+        if excess_mem_size <= 0:
+            self.mem_ranges = [AddrRange(0, size = mem_size)]
         else:
-            m5.fatal("No CPU type {}".format(cpu_type))
+            print("Physical memory size specified is %s which is greater than"\
+                  " 3GB.  Twice the number of memory controllers would be "\
+                  "created."  % (mem_size))
 
-        map(lambda c: c.createThreads(), self.cpu)
+            self.mem_ranges = [AddrRange(0, size = Addr('3GB')),
+                        AddrRange(Addr('4GB'), size = excess_mem_size)]
+
+        if self._opts.dgpu or self._opts.apu:
+            self.shadow_rom_ranges = [AddrRange(0xc0000, size = Addr('128kB'))]
+
+    def createGPU(self):
+        # shader is the GPU
+        self.shader = Shader(n_wf = self._opts.wfs_per_simd,
+                        clk_domain = SrcClockDomain(
+                        clock = self._opts.gpu_clock,
+                            voltage_domain = VoltageDomain(
+                                voltage = self._opts.gpu_voltage)))
+
+        # VIPER GPU protocol implements release consistency at GPU side. So,
+        # we make their writes visible to the global memory and should read
+        # from global memory during kernal boundary. The pipeline initiates
+        # (or do not initiate) the acquire/release operation depending on
+        # these impl_kern_launch_rel and impl_kern_end_rel flags. The flag=true
+        # means pipeline initiates a acquire/release operation at kernel
+        # launch/end. VIPER protocol is write-through based, and thus only
+        # impl_kern_launch_acq needs to set.
+        if (buildEnv['PROTOCOL'] == 'GPU_VIPER'):
+            self.shader.impl_kern_launch_acq = True
+            self.shader.impl_kern_end_rel = False
+        else:
+            self.shader.impl_kern_launch_acq = True
+            self.shader.impl_kern_end_rel = True
+
+        # List of compute units; one GPU can have multiple compute units
+        compute_units = []
+
+        for i in xrange(self._opts.num_compute_units):
+            compute_units.append(
+                     ComputeUnit(cu_id = i, perLaneTLB = False,
+                                 num_SIMDs = self._opts.simds_per_cu,
+                                 wf_size = self._opts.wf_size,
+                                 spbypass_pipe_length = \
+                                 self._opts.sp_bypass_path_length,
+                                 dpbypass_pipe_length = \
+                                 self._opts.dp_bypass_path_length,
+                                 issue_period = self._opts.issue_period,
+                                 coalescer_to_vrf_bus_width = \
+                                 self._opts.glbmem_rd_bus_width,
+                                 vrf_to_coalescer_bus_width = \
+                                 self._opts.glbmem_wr_bus_width,
+                                 num_global_mem_pipes = \
+                                 self._opts.glb_mem_pipes_per_cu,
+                                 num_shared_mem_pipes = \
+                                 self._opts.shr_mem_pipes_per_cu,
+                                 n_wf = self._opts.wfs_per_simd,
+                                 execPolicy = self._opts.CUExecPolicy,
+                                 debugSegFault = self._opts.SegFaultDebug,
+                                 functionalTLB = self._opts.FunctionalTLB,
+                                 localMemBarrier = self._opts.LocalMemBarrier,
+                                 countPages = self._opts.countPages,
+                                 localDataStore = \
+                                 LdsState(banks = self._opts.numLdsBanks,
+                                          bankConflictPenalty = \
+                                          self._opts.ldsBankConflictPenalty)))
+
+            wavefronts = []
+            vrfs = []
+            vrf_pool_mgrs = []
+            srfs = []
+            srf_pool_mgrs = []
+            for j in xrange(self._opts.simds_per_cu):
+                for k in xrange(self.shader.n_wf):
+                    wavefronts.append(Wavefront(simdId = j, wf_slot_id = k,
+                                                wf_size = self._opts.wf_size))
+                vrf_pool_mgrs.append(
+                                 SimplePoolManager(pool_size = \
+                                                   self._opts.vreg_file_size,
+                                                   min_alloc = \
+                                                   self._opts.vreg_min_alloc))
+
+                vrfs.append(
+                     VectorRegisterFile(simd_id=j, wf_size=self._opts.wf_size,
+                                        num_regs=self._opts.vreg_file_size))
+
+                srf_pool_mgrs.append(
+                                 SimplePoolManager(pool_size = \
+                                                   self._opts.sreg_file_size,
+                                                   min_alloc = \
+                                                   self._opts.vreg_min_alloc))
+                srfs.append(
+                    ScalarRegisterFile(simd_id=j, wf_size=self._opts.wf_size,
+                                       num_regs=self._opts.sreg_file_size))
+
+            compute_units[-1].wavefronts = wavefronts
+            compute_units[-1].vector_register_file = vrfs
+            compute_units[-1].scalar_register_file = srfs
+            compute_units[-1].register_manager = \
+                RegisterManager(policy=self._opts.registerManagerPolicy,
+                                vrf_pool_managers=vrf_pool_mgrs,
+                                srf_pool_managers=srf_pool_mgrs)
+            if self._opts.TLB_prefetch:
+                compute_units[-1].prefetch_depth = self._opts.TLB_prefetch
+                compute_units[-1].prefetch_prev_type = self._opts.pf_type
+
+            # attach the LDS and the CU to the bus (actually a Bridge)
+            compute_units[-1].ldsPort = compute_units[-1].ldsBus.slave
+            compute_units[-1].ldsBus.master = \
+                compute_units[-1].localDataStore.cuPort
+
+
+        self.shader.CUs = compute_units
+
+        self.shader.cpu_pointer = self.cpu[0]
+
+    # Creates TimingSimpleCPU by default
+    def createCPU(self):
+        self.warmupCpu = [TimingSimpleCPU(cpu_id = i, switched_out = True)
+                          for i in range(self._opts.num_cpus)]
+        map(lambda c: c.createThreads(), self.warmupCpu)
+        if self._opts.cpu_type == "TimingSimpleCPU":
+            print("Running with Timing Simple CPU")
+            self.mem_mode = 'timing'
+            self.cpu = [TimingSimpleCPU(cpu_id = i, switched_out = False)
+                              for i in range(self._opts.num_cpus)]
+            map(lambda c: c.createThreads(), self.cpu)
+        elif self._opts.cpu_type == "AtomicSimpleCPU":
+            print("Running with Atomic Simple CPU")
+            if self._opts.ruby:
+                self.mem_mode = 'atomic_noncaching'
+            else:
+                self.mem_mode = 'atomic'
+            self.cpu = [AtomicSimpleCPU(cpu_id = i, switched_out = False)
+                              for i in range(self._opts.num_cpus)]
+            map(lambda c: c.createThreads(), self.cpu)
+        elif self._opts.cpu_type == "DerivO3CPU":
+            print("Running with O3 CPU")
+            self.mem_mode = 'timing'
+            self.cpu = [DerivO3CPU(cpu_id = i, switched_out = False)
+                              for i in range(self._opts.num_cpus)]
+            map(lambda c: c.createThreads(), self.cpu)
+        elif self._opts.cpu_type == "X86KvmCPU":
+            print("Running with KVM to start")
+            # Note KVM needs a VM and atomic_noncaching
+            self.mem_mode = 'atomic_noncaching'
+            self.cpu = [X86KvmCPU(cpu_id = i, hostFreq = "3.6GHz")
+                        for i in range(self._opts.num_cpus)]
+            self.kvm_vm = KvmVM()
+            map(lambda c: c.createThreads(), self.cpu)
+        else:
+            panic("Bad CPU type!")
+
+    def switchCpus(self, old, new):
+        assert(new[0].switchedOut())
+        m5.switchCpus(self, zip(old, new))
 
     def setDiskImages(self, img_path_1, img_path_2):
         disk0 = CowDisk(img_path_1)
         disk2 = CowDisk(img_path_2)
         self.pc.south_bridge.ide.disks = [disk0, disk2]
 
-    def createCacheHierarchy(self):
-        for cpu in self.cpu:
-            # Create a memory bus, a coherent crossbar, in this case
-            cpu.l2bus = L2XBar()
+    def setDiskImage(self, img_path_1):
+        disk0 = CowDisk(img_path_1)
+        self.pc.south_bridge.ide.disks = [disk0]
 
-            # Create an L1 instruction and data cache
-            cpu.icache = L1ICache(self._opts)
-            cpu.dcache = L1DCache(self._opts)
-            cpu.mmucache = MMUCache()
+    def createDMADevices(self):
+        if self._opts.dgpu or self._opts.apu:
+            # Set up the HSA packet processor
+            hsapp_gpu_map_paddr = int(Addr(self._opts.mem_size))
+            gpu_hsapp = HSAPacketProcessor(pioAddr=hsapp_gpu_map_paddr,
+                                          numHWQueues=self._opts.num_hw_queues)
 
-            # Connect the instruction and data caches to the CPU
-            cpu.icache.connectCPU(cpu)
-            cpu.dcache.connectCPU(cpu)
-            cpu.mmucache.connectCPU(cpu)
+            dispatcher = GPUDispatcher()
+            gpu_cmd_proc = GPUCommandProcessor(hsapp=gpu_hsapp,
+                                               dispatcher=dispatcher)
 
-            # Hook the CPU ports up to the l2bus
-            cpu.icache.connectBus(cpu.l2bus)
-            cpu.dcache.connectBus(cpu.l2bus)
-            cpu.mmucache.connectBus(cpu.l2bus)
+            self.shader.dispatcher = dispatcher
+            self.shader.gpu_cmd_proc = gpu_cmd_proc
+            self._dma_ports.append(gpu_hsapp)
+            self._dma_ports.append(gpu_cmd_proc)
 
-            # Create an L2 cache and connect it to the l2bus
-            cpu.l2cache = L2Cache(self._opts)
-            cpu.l2cache.connectCPUSideBus(cpu.l2bus)
+    def createMemoryHierarchy(self):
+        self.createDMADevices()
 
-            # Connect the L2 cache to the L3 bus
-            cpu.l2cache.connectMemSideBus(self.membus)
+        # VIPER requires the number of instruction and scalar caches
+        if (buildEnv['PROTOCOL'] == 'GPU_VIPER'):
+            # Currently, the sqc (I-Cache of GPU) is shared by
+            # multiple compute units(CUs). The protocol works just fine
+            # even if sqc is not shared. Overriding this option here
+            # so that the user need not explicitly set this (assuming
+            # sharing sqc is the common usage)
+            self._opts.num_sqc = \
+                int(math.ceil(float(self._opts.num_compute_units)\
+                                    / self._opts.cu_per_sqc))
+            self._opts.num_scalar_cache = \
+                int(math.ceil(float(self._opts.num_compute_units)\
+                                        / self._opts.cu_per_scalar_cache))
+
+        Ruby.create_system(self._opts, True, self, self.iobus,
+                           self._dma_ports, None)
+
+        # don't connect ide as it gets connected in attachIO call
+        for dma_port in self._dma_ports[1:]:
+            dma_port.pio = self.iobus.master
+
+        self.ruby.clk_domain = SrcClockDomain()
+        self.ruby.clk_domain.clock = self._opts.ruby_clock
+        self.ruby.clk_domain.voltage_domain = VoltageDomain()
+
+        for i, cpu in enumerate(self.cpu):
+            cpu.icache_port = self.ruby._cpu_ports[i].slave
+            cpu.dcache_port = self.ruby._cpu_ports[i].slave
+
+            cpu.itb.walker.port = self.ruby._cpu_ports[i].slave
+            cpu.dtb.walker.port = self.ruby._cpu_ports[i].slave
+
+
+        if self._opts.dgpu or self._opts.apu:
+            gpu_port_idx = len(self.ruby._cpu_ports) \
+                           - self._opts.num_compute_units \
+                           - self._opts.num_sqc \
+                           - self._opts.num_scalar_cache
+
+            for i in xrange(self._opts.num_compute_units):
+                for j in xrange(self._opts.wf_size):
+                    self.shader.CUs[i].memory_port[j] = \
+                        self.ruby._cpu_ports[gpu_port_idx].slave[j]
+                gpu_port_idx += 1
+
+            for i in xrange(self._opts.num_compute_units):
+                if i > 0 and not i % self._opts.cu_per_sqc:
+                    gpu_port_idx += 1
+                self.shader.CUs[i].sqc_port = \
+                    self.ruby._cpu_ports[gpu_port_idx].slave
+
+            gpu_port_idx += 1
+
+            for i in xrange(self._opts.num_compute_units):
+                if i > 0 and not i % self._opts.cu_per_scalar_cache:
+                    gpu_port_idx += 1
+                self.shader.CUs[i].scalar_port = \
+                    self.ruby._cpu_ports[gpu_port_idx].slave
 
     def setupInterrupts(self):
-        for cpu in self.cpu:
-            # create the interrupt controller CPU and connect to the membus
+        for i, cpu in enumerate(self.cpu):
+            # create the interrupt controller CPU and connect to RubyPort
             cpu.createInterruptController()
 
             # For x86 only, connect interrupts to the memory
-            # Note: these are directly connected to the memory bus and
+            # Note: these are directly connected to RubyPort and
             #       not cached
-            cpu.interrupts[0].pio = self.membus.master
-            cpu.interrupts[0].int_master = self.membus.slave
-            cpu.interrupts[0].int_slave = self.membus.master
+            cpu.interrupts[0].pio = self.ruby._cpu_ports[i].master
+            cpu.interrupts[0].int_master = self.ruby._cpu_ports[i].slave
+            cpu.interrupts[0].int_slave = self.ruby._cpu_ports[i].master
 
-
-    def createMemoryControllersDDR3(self):
-        self._createMemoryControllers(1, DDR3_1600_8x8)
-
-    def _createMemoryControllers(self, num, cls):
-        self.mem_cntrls = [
-            cls(range = self.mem_ranges[0],
-                port = self.membus.master)
-            for i in range(num)
-        ]
-
-    def initFS(self, membus, cpus):
+    def initFS(self):
         self.pc = Pc()
-
-        # Constants similar to x86_traits.hh
-        IO_address_space_base = 0x8000000000000000
-        pci_config_address_space_base = 0xc000000000000000
-        interrupts_address_space_base = 0xa000000000000000
-        APIC_range_size = 1 << 12;
 
         # North Bridge
         self.iobus = IOXBar()
-        self.bridge = Bridge(delay='50ns')
-        self.bridge.master = self.iobus.slave
-        self.bridge.slave = membus.master
-        # Allow the bridge to pass through:
-        #  1) kernel configured PCI device memory map address: address range
-        #  [0xC0000000, 0xFFFF0000). (The upper 64kB are reserved for m5ops.)
-        #  2) the bridge to pass through the IO APIC (two pages, already
-        #     contained in 1),
-        #  3) everything in the IO address range up to the local APIC, and
-        #  4) then the entire PCI address space and beyond.
-        self.bridge.ranges = \
-            [
-            AddrRange(0xC0000000, 0xFFFF0000),
-            AddrRange(IO_address_space_base,
-                      interrupts_address_space_base - 1),
-            AddrRange(pci_config_address_space_base,
-                      Addr.max)
-            ]
 
-        # Create a bridge from the IO bus to the memory bus to allow access
-        # to the local APIC (two pages)
-        self.apicbridge = Bridge(delay='50ns')
-        self.apicbridge.slave = self.iobus.master
-        self.apicbridge.master = membus.slave
-        self.apicbridge.ranges = [AddrRange(interrupts_address_space_base,
-                                            interrupts_address_space_base +
-                                            cpus * APIC_range_size
-                                            - 1)]
+        # add the ide to the list of dma devices that later need to attach to
+        # dma controllers
+        if (buildEnv['PROTOCOL'] == 'GPU_VIPER'):
+            # VIPER expects the port itself while others use the dma object
+            self._dma_ports = [self.pc.south_bridge.ide]
+            self.pc.attachIO(self.iobus, [p.dma for p in self._dma_ports])
+        else:
+            self._dma_ports = [self.pc.south_bridge.ide.dma]
+            self.pc.attachIO(self.iobus, [port for port in self._dma_ports])
 
-        # connect the io bus
-        self.pc.attachIO(self.iobus)
-
-        # Add a tiny cache to the IO bus.
-        # This cache is required for the classic memory model for coherence
-        self.iocache = Cache(assoc=8,
-                            tag_latency = 50,
-                            data_latency = 50,
-                            response_latency = 50,
-                            mshrs = 20,
-                            size = '1kB',
-                            tgts_per_mshr = 12,
-                            addr_ranges = self.mem_ranges)
-        self.iocache.cpu_side = self.iobus.master
-        self.iocache.mem_side = self.membus.slave
+        if self._opts.dgpu or self._opts.apu:
+            # add GPU to southbridge
+            self.pc.south_bridge.attachGPU(self.iobus,
+                             [port.dma for port in self._dma_ports])
 
         self.intrctrl = IntrControl()
 
@@ -244,20 +397,23 @@ class MySystem(LinuxX86System):
         # Set up the Intel MP table
         base_entries = []
         ext_entries = []
-        for i in range(cpus):
+
+        for i in range(self._opts.num_cpus):
             bp = X86IntelMPProcessor(
                     local_apic_id = i,
                     local_apic_version = 0x14,
                     enable = True,
                     bootstrap = (i ==0))
             base_entries.append(bp)
+
         io_apic = X86IntelMPIOAPIC(
-                id = cpus,
+                id = self._opts.num_cpus,
                 version = 0x11,
                 enable = True,
                 address = 0xfec00000)
         self.pc.south_bridge.io_apic.apic_id = io_apic.id
         base_entries.append(io_apic)
+
         pci_bus = X86IntelMPBus(bus_id = 0, bus_type='PCI   ')
         base_entries.append(pci_bus)
         isa_bus = X86IntelMPBus(bus_id = 1, bus_type='ISA   ')
@@ -274,6 +430,7 @@ class MySystem(LinuxX86System):
                 dest_io_apic_id = io_apic.id,
                 dest_io_apic_intin = 16)
         base_entries.append(pci_dev4_inta)
+
         def assignISAInt(irq, apicPin):
             assign_8259_to_apic = X86IntelMPIOIntAssignment(
                     interrupt_type = 'ExtInt',
@@ -293,6 +450,7 @@ class MySystem(LinuxX86System):
                     dest_io_apic_id = io_apic.id,
                     dest_io_apic_intin = apicPin)
             base_entries.append(assign_to_apic)
+
         assignISAInt(0, 2)
         assignISAInt(1, 1)
         for i in range(3, 15):
@@ -310,9 +468,20 @@ class MySystem(LinuxX86System):
                     size = '%dB' % (self.mem_ranges[0].size() - 0x100000),
                     range_type = 1),
             ]
+        # Mark [mem_size, 3GB) as reserved if memory less than 3GB, which
+        # force IO devices to be mapped to [0xC0000000, 0xFFFF0000). Requests
+        # to this specific range can pass though bridge to iobus.
+        entries.append(X86E820Entry(addr = self.mem_ranges[0].size(),
+            size='%dB' % (0xC0000000 - self.mem_ranges[0].size()),
+            range_type=2))
 
         # Reserve the last 16kB of the 32-bit address space for m5ops
         entries.append(X86E820Entry(addr = 0xFFFF0000, size = '64kB',
                                     range_type=2))
+
+        # Add the rest of memory. This is where all the actual data is
+        entries.append(X86E820Entry(addr = self.mem_ranges[-1].start,
+            size='%dB' % (self.mem_ranges[-1].size()),
+            range_type=1))
 
         self.e820_table.entries = entries
