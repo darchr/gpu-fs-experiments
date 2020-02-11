@@ -61,7 +61,7 @@
         },
         {
             "type": "file",
-            "source": "gpu-fs/runscript.sh",
+            "source": "runscript.sh",
             "destination": "/home/gem5/"
         },
         {
@@ -69,7 +69,7 @@
             "execute_command": "echo '{{ user `ssh_password` }}' | {{.Vars}} sudo -E -S bash '{{.Path}}'",
             "scripts": 
             [
-                "gpu-fs/post-installation.sh"
+                "post-installation.sh"
             ]
         },
         {
@@ -78,7 +78,7 @@
 	    "expect_disconnect": "true",
             "scripts": 
             [
-                "gpu-fs/update-kernel.sh"
+                "update-kernel.sh"
             ]
         },
         {
@@ -87,7 +87,7 @@
 	    "pause_before": "10s",
             "scripts": 
             [
-                "gpu-fs/add-ROCm.sh"
+                "add-ROCm.sh"
             ]
         },
         {
