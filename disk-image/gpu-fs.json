@@ -115,7 +115,7 @@
         "ssh_username": "gem5",
         "vm_cpus": "16",
         "vm_memory": "8192",
-        "image_name": "ubuntu-18.04"
+        "image_name": "gpu-fs"
   }
 
 }
