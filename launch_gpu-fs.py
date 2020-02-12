@@ -84,7 +84,7 @@ linux_binary = Artifact.registerArtifact(
     cwd = 'disk-image/gpu-fs/',
     command = '''
     ''',
-    inputs = [experiments_repo, linux_repo,],
+    inputs = [experiments_repo,],
     documentation = "kernel binary built inside the guest system",
 )
 
@@ -103,10 +103,9 @@ if __name__ == "__main__":
                     run = gem5Run.createFSRun(
                         'gem5/build/X86_MESI_Two_Level/gem5.opt',
                         'gem5-configs/run_fs.py',
-                        'results/gpu-fs/{}/{}/{}/{}'.
-                        format(cpu, mem, num_cpu, boot_type),
+                        'results/gpu-fs/',
                         gem5_binary, gem5_repo, experiments_repo,
-                        os.path.join('disk-image', 'gpu-fs','vmlinux'),
+                        'disk-image/gpu-fs/vmlinux',
                         'disk-image/gpu-fs/gpu-fs-image/gpu-fs',
                         linux_binary, disk_image,
                         cpu, mem, num_cpu, boot_type,
