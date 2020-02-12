@@ -72,7 +72,7 @@ gem5_binary = Artifact.registerArtifact(
     typ = 'gem5 binary',
     name = 'gem5',
     cwd = 'gem5/',
-    path =  'gem5/build/X86/gem5.opt',
+    path =  'gem5/build/X86_MESI_Two_Level/gem5.opt',
     inputs = [gem5_repo,],
     documentation = 'Cloning the current tip, and cherry-picking the patches from the staging branch.'
 )
@@ -101,7 +101,7 @@ if __name__ == "__main__":
             for num_cpu in num_cpus:
                 for mem in mem_types:
                     run = gem5Run.createFSRun(
-                        'gem5/build/X86/gem5.opt',
+                        'gem5/build/X86_MESI_Two_Level/gem5.opt',
                         'gem5-configs/run_fs.py',
                         'results/gpu-fs/{}/{}/{}/{}'.
                         format(cpu, mem, num_cpu, boot_type),
