@@ -59,13 +59,15 @@ disk_image = Artifact.registerArtifact(
     documentation = 'Ubuntu with m5 binary installed and root auto login'
 )
 
+## Let's use MESI_Two_Level before we get the GPU code merged in from staging branch, later we can do
+## scons build/GCN3_X86/gem5.opt -j8
 gem5_binary = Artifact.registerArtifact(
     command = '''cd gem5;
     git fetch "https://gem5.googlesource.com/amd/gem5" refs/changes/83/23483/1 && git cherry-pick FETCH_HEAD
     git fetch "https://gem5.googlesource.com/amd/gem5" refs/changes/84/23484/1 && git cherry-pick FETCH_HEAD
     git fetch "https://gem5.googlesource.com/amd/gem5" refs/changes/85/23485/4 && git cherry-pick FETCH_HEAD
     git fetch "https://gem5.googlesource.com/amd/gem5" refs/changes/43/23743/3 && git cherry-pick FETCH_HEAD
-    scons build/X86/gem5.opt PROTOCOL = 'GPU_VIPER' TARGET_GPU_ISA = 'gcn3' BUILD_GPU = True -j8
+    scons build/X86_MESI_Two_Level/gem5.opt -j8
     ''',
     typ = 'gem5 binary',
     name = 'gem5',
@@ -74,6 +76,18 @@ gem5_binary = Artifact.registerArtifact(
     inputs = [gem5_repo,],
     documentation = 'Cloning the current tip, and cherry-picking the patches from the staging branch.'
 )
+
+linux_binary = Artifact.registerArtifact(
+    name = 'vmlinux',
+    typ = 'kernel',
+    path = 'disk-image/gpu-fs/vmlinux',
+    cwd = 'disk-image/gpu-fs/',
+    command = '''
+    ''',
+    inputs = [experiments_repo, linux_repo,],
+    documentation = "kernel binary built inside the guest system",
+)
+
 
 if __name__ == "__main__":
     boot_types = ['systemd']
@@ -88,13 +102,13 @@ if __name__ == "__main__":
                 for mem in mem_types:
                     run = gem5Run.createFSRun(
                         'gem5/build/X86/gem5.opt',
-                        'configs-boot-tests/run_exit.py',
-                        'results/run_exit/vmlinux-{}/boot-exit/{}/{}/{}/{}'.
-                        format(linux, cpu, mem, num_cpu, boot_type),
+                        'gem5-configs/run_fs.py',
+                        'results/gpu-fs/{}/{}/{}/{}'.
+                        format(cpu, mem, num_cpu, boot_type),
                         gem5_binary, gem5_repo, experiments_repo,
-                        os.path.join('disk-image', 'vmlinux'),
+                        os.path.join('disk-image', 'gpu-fs','vmlinux'),
                         'disk-image/gpu-fs/gpu-fs-image/gpu-fs',
-                        linux_binaries[linux], disk_image,
+                        linux_binary, disk_image,
                         cpu, mem, num_cpu, boot_type,
                         timeout = 6*60*60 #6 hours
                         )
