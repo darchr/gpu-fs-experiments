@@ -101,6 +101,7 @@ if __name__ == "__main__":
             for num_cpu in num_cpus:
                 for mem in mem_types:
                     run = gem5Run.createFSRun(
+                        'gpu-fs-test',
                         'gem5/build/X86_MESI_Two_Level/gem5.opt',
                         'gem5-configs/run_fs.py',
                         'results/gpu-fs/',
