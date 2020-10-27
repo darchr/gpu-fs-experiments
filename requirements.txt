@@ -6,7 +6,7 @@ Cheetah==2.4.4
 configparser==4.0.2
 configshell-fb==1.1.24
 contextlib2==0.6.0.post1
-cryptography==2.3
+cryptography==3.2
 enum34==1.1.6
 idna==2.6
 importlib-metadata==0.23
